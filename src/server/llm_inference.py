@@ -7,9 +7,12 @@ import os
 from dotenv import load_dotenv
 import pynvml
 import pdb
+import re
+from datetime import datetime
 
 load_dotenv()
 LLM_DIR = os.getenv("LLM_MODEL_STORAGE")
+os.environ["VLLM_LOGGING_LEVEL"] = "ERROR"
 
 def get_vram_status():
     pynvml.nvmlInit()
@@ -41,6 +44,15 @@ class VLLMSingleton:
             cls._instance = AsyncLLMEngine.from_engine_args(engine_args)
         return cls._instance
 
+    @classmethod
+    async def shutdown(cls):
+        """Cleanly stop the engine and background workers."""
+        if cls._instance is not None:
+            print("Shutting down vLLM engine...")
+            await asyncio.sleep(1.0) 
+            cls._instance = None
+            print("Engine shut down successfully.")
+
 class UserSession:
     def __init__(self, 
             user_id: str, 
@@ -49,6 +61,7 @@ class UserSession:
         self.user_id = user_id
         self.temp_setting = temp_setting
         self.engine = VLLMSingleton.get_engine()
+        self.current_request_id = None  # Track the active task
         # Initialize history with the system prompt
         self.history = [{"role": "system", "content": system_prompt}]
 
@@ -63,46 +76,92 @@ class UserSession:
         prompt += "<|im_start|>assistant\n"
         return prompt
 
-    async def generate(self, user_input: str):
+    async def _save_thought_to_disk(self, thought_text: str):
+        """Saves the <think> block to a local file."""
+        log_dir = "logs/thoughts"
+        os.makedirs(log_dir, exist_ok=True)
+        
+        filename = f"{log_dir}/{self.user_id}_thoughts.log"
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        with open(filename, "a", encoding="utf-8") as f:
+            f.write(f"--- {timestamp} ---\n{thought_text.strip()}\n\n")
+
+    async def generate(self, user_input: str,
+            add_thinking_output: bool = False):
         # 1. Add user input to history
         self.history.append({"role": "user", "content": user_input})
         
         # 2. Format the full conversation for the model
         full_prompt = self._format_chat()
         
-        request_id = f"{self.user_id}-{uuid.uuid4()}"
+        self.current_request_id = f"{self.user_id}-{uuid.uuid4()}"
+
+        # extra_body = None
+        # if not add_thinking_output:
+        #     extra_body={"chat_template_kwargs": {"enable_thinking": False}}
         sampling_params = SamplingParams(
             temperature=self.temp_setting, 
             max_tokens=512,
-            stop=["<|im_end|>", "<|endoftext|>"]
+            stop=["<|im_end|>", "<|endoftext|>"],
+            # extra_args=extra_body,
         )
-        
-        # 3. Stream from the engine
-        results_generator = self.engine.generate(full_prompt, sampling_params, request_id)
-        
-        final_text = ""
-        async for request_output in results_generator:
-            final_text = request_output.outputs[0].text
-            
-        # 4. Save the model's response to history for the next turn
-        self.history.append({"role": "assistant", "content": final_text})
 
-        return final_text
+        # 3. Stream from the engine
+        results_generator = self.engine.generate(full_prompt, sampling_params, self.current_request_id)
+        
+        raw_text = ""
+        async for request_output in results_generator:
+            raw_text = request_output.outputs[0].text
+        
+        clean_text = re.sub(r'<think>.*?</think>', '', raw_text, flags=re.DOTALL).strip()
+        # Regex to find everything between <think> tags
+        thought_match = re.search(r'<think>(.*?)</think>', raw_text, flags=re.DOTALL)
+
+        if thought_match:
+            thought_content = thought_match.group(1)
+            await self._save_thought_to_disk(raw_text)
+
+        # 4. Save the model's response to history for the next turn
+        self.history.append({"role": "assistant", "content": clean_text})
+
+        return clean_text
     
     def get_vram_status(self):
         get_vram_status()
 
+    async def abort(self):
+        """Immediately stops the current generation on the GPU."""
+        if self.current_request_id:
+            print(f"Aborting request: {self.current_request_id}")
+            # vLLM's AsyncLLMEngine.abort is a sync method in most versions
+            # but wrapping in a check for safety
+            self.engine.abort(self.current_request_id)
+            self.current_request_id = None
+
 # --- Example Usage ---
 async def main():
-    alice = UserSession("Alice")
-    
-    # First turn
-    resp1 = await alice.generate("My name is Alice. Remember that.")
-    print(f"Bot: {resp1}")
-    
-    # Second turn (The model will remember the name)
-    resp2 = await alice.generate("What is my name?")
-    print(f"Bot: {resp2}")
+    try:
+        user = "Alice"
+        alice = UserSession(user)
+        
+        # First turn
+        msg ="My name is Alice. Remember that."
+        print(f"{user}: {msg}")
+        resp1 = await alice.generate(msg)
+        print(f"Bot: {resp1}")
+        
+        # Second turn (The model will remember the name)
+        msg = "What is my name?"
+        print(f"{user}: {msg}")
+        resp2 = await alice.generate(msg)
+        print(f"Bot: {resp2}")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        
+    finally:
+        # CRITICAL: This prevents the 'died unexpectedly' error
+        await VLLMSingleton.shutdown()
 
 if __name__ == "__main__":
     asyncio.run(main())

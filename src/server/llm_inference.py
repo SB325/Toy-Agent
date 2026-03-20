@@ -102,6 +102,16 @@ class UserSession:
             max_tokens: int = 512,
             fill_fraction_limit=0.5):
 
+        ## Given the limited context window, a balance must be struck between
+        #   user input length and max_(output)token length. Regardless of
+        #   VRAM size, ultimately context management must be performed in a 
+        #   manner that enables virtually unlimited llm memory.
+        #
+        #   TODO: Write history to disk for each prompt and response. Query the history for 
+        #   context relevant to the prompt and fill the context window
+        #   (minus max_token length) with that context prior to inference. The
+        #   longer/shorter the needed max_token length, the shorter/longer the context 
+        #   length can be.
         fill_fraction = (len(user_input)+max_tokens)/(self.max_model_len)
         if fill_fraction > fill_fraction_limit:
             return f"[ERROR]: Prompt and max_tokens response will take up " + \
